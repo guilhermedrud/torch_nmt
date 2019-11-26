@@ -1,369 +1,644 @@
-import itertools, os, time , datetime
+import sacrebleu
 import numpy as np
-import spacy
 import torch
 import torch.nn as nn
-from torchtext import data, datasets
-from torchtext.vocab import Vectors, GloVe
-use_gpu = torch.cuda.is_available()
+import torch.nn.functional as F
+import math, copy, time
+import matplotlib.pyplot as plt
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+from IPython.core.debugger import set_trace
 
-def preprocess(vocab_size=0, batchsize=16, max_sent_len=20):
-    '''Loads data from text files into iterators'''
+# we will use CUDA if it is available
+USE_CUDA = torch.cuda.is_available()
+DEVICE=torch.device('cuda:0') # or set to 'cpu'
+print("CUDA:", USE_CUDA)
+print(DEVICE)
 
-    # Load text tokenizers
-    spacy_de = spacy.load('de')
-    spacy_en = spacy.load('en')
+seed = 42
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
 
-    def tokenize(text, lang='en'):
-        if lang is 'de':
-            return [tok.text for tok in spacy_de.tokenizer(text)]
-        elif lang is 'en':
-            return [tok.text for tok in spacy_en.tokenizer(text)]
-        else:
-            raise Exception('Invalid language')
-
-    # Add beginning-of-sentence and end-of-sentence tokens 
-    BOS_WORD = '<s>'
-    EOS_WORD = '</s>'
-    DE = data.Field(tokenize=lambda x: tokenize(x, 'de'))
-    EN = data.Field(tokenize=tokenize, init_token=BOS_WORD, eos_token=EOS_WORD)
-
-    # Create sentence pair dataset with max length 20
-    train, val, test = datasets.IWSLT.splits(exts=('.de', '.en'), fields=(DE, EN), filter_pred = lambda x: max(len(vars(x)['src']), len(vars(x)['trg'])) <= max_sent_len)
-
-    # Build vocabulary and convert text to indices
-    # Convert words that appear fewer than 5 times to <unk>
-    if vocab_size > 0:
-        DE.build_vocab(train.src, min_freq=5, max_size=vocab_size)
-        EN.build_vocab(train.trg, min_freq=5, max_size=vocab_size)
-    else:
-        DE.build_vocab(train.src, min_freq=5)
-        EN.build_vocab(train.trg, min_freq=5)
-
-    # Create iterators to process text in batches of approx. the same length
-    train_iter = data.BucketIterator(train, batch_size=batchsize, device=-1, repeat=False, sort_key=lambda x: len(x.src))
-    val_iter = data.BucketIterator(val, batch_size=1, device=-1, repeat=False, sort_key=lambda x: len(x.src))
+class EncoderDecoder(nn.Module):
+    """
+    A standard Encoder-Decoder architecture. Base for this and many 
+    other models.
+    """
+    def __init__(self, encoder, decoder, src_embed, trg_embed, generator):
+        super(EncoderDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.trg_embed = trg_embed
+        self.generator = generator
+        
+    def forward(self, src, trg, src_mask, trg_mask, src_lengths, trg_lengths):
+        """Take in and process masked src and target sequences."""
+        encoder_hidden, encoder_final = self.encode(src, src_mask, src_lengths)
+        return self.decode(encoder_hidden, encoder_final, src_mask, trg, trg_mask)
     
-    return DE, EN, train_iter, val_iter
-
-# Test
-timer = time.time()
-SRC, TGT, train_iter, val_iter = preprocess()
-
-print('''This is a test of our preprocessing function. It took {:.1f} seconds to load the data. 
-Our German vocab has size {} and our English vocab has size {}.
-Our training data has {} batches, each with {} sentences, and our validation data has {} batches.'''.format(
-time.time() - timer, len(SRC.vocab), len(TGT.vocab), len(train_iter), train_iter.batch_size, len(val_iter)))
+    def encode(self, src, src_mask, src_lengths):
+        return self.encoder(self.src_embed(src), src_mask, src_lengths)
+    
+    def decode(self, encoder_hidden, encoder_final, src_mask, trg, trg_mask,
+               decoder_hidden=None):
+        return self.decoder(self.trg_embed(trg), encoder_hidden, encoder_final,
+                            src_mask, trg_mask, hidden=decoder_hidden)
 
 
-def load_embeddings(SRC, TGT, np_src_file, np_tgt_file):
-    emb_tr_src = torch.from_numpy(np.load(np_src_file))
-    emb_tr_tgt = torch.from_numpy(np.load(np_tgt_file))
-    return emb_tr_src, emb_tr_tgt
-
-
-class EncoderLSTM(nn.Module):
-    def __init__(self, embedding, h_dim, num_layers, dropout_p=0.0, bidirectional=True):
-        super(EncoderLSTM, self).__init__()
-        self.vocab_size, self.embedding_size = embedding.size()
-        self.num_layers, self.h_dim, self.dropout_p, self.bidirectional = num_layers, h_dim, dropout_p, bidirectional 
-
-        # Create embedding and LSTM
-        self.embedding = nn.Embedding(self.vocab_size, self.embedding_size)
-        self.embedding.weight.data.copy_(embedding)
-        self.lstm = nn.LSTM(self.embedding_size, self.h_dim, self.num_layers, dropout=self.dropout_p, bidirectional=bidirectional)
-        self.dropout = nn.Dropout(dropout_p)
+class Generator(nn.Module):
+    """Define standard linear + softmax generation step."""
+    def __init__(self, hidden_size, vocab_size):
+        super(Generator, self).__init__()
+        self.proj = nn.Linear(hidden_size, vocab_size, bias=False)
 
     def forward(self, x):
-        '''Embed text, get initial LSTM hidden state, and encode with LSTM'''
-        x = self.dropout(self.embedding(x)) # embedding
-        h0 = self.init_hidden(x.size(1)) # initial state of LSTM
-        memory_bank, h = self.lstm(x, h0) # encoding
-        return memory_bank, h
+        return F.log_softmax(self.proj(x), dim=-1)
 
-    def init_hidden(self, batch_size):
-        '''Create initial hidden state of zeros: 2-tuple of num_layers x batch size x hidden dim'''
-        num_layers = self.num_layers * 2 if self.bidirectional else self.num_layers
-        init = torch.zeros(num_layers, batch_size, self.h_dim)
-        init = init.cuda() if use_gpu else init
-        h0 = (init, init.clone())
-
-class Attention(nn.Module):
-    def __init__(self, pad_token=1, bidirectional=True, h_dim=300):
-        super(Attention, self).__init__()
-        self.bidirectional, self.h_dim, self.pad_token = bidirectional, h_dim, pad_token
-        self.softmax = nn.Softmax(dim=1)
-
-    def forward(self, in_e, out_e, out_d):
-        '''Produces context with attention distribution'''
-
-        # Deal with bidirectional encoder, move batches first
-        if self.bidirectional: # sum hidden states for both directions
-            out_e = out_e.contiguous().view(out_e.size(0), out_e.size(1), 2, -1).sum(2).view(out_e.size(0), out_e.size(1), -1)
-            
-        # Move batches first
-        out_e = out_e.transpose(0,1) # b x sl x hd
-        out_d = out_d.transpose(0,1) # b x tl x hd
-
-        # Dot product attention, softmax, and reshape
-        attn = out_e.bmm(out_d.transpose(1,2)) # (b x sl x hd) (b x hd x tl) --> (b x sl x tl)
-        attn = self.softmax(attn).transpose(1,2) # --> b x tl x sl
-
-        # Get attention distribution
-        context = attn.bmm(out_e) # --> b x tl x hd
-        context = context.transpose(0,1) # --> tl x b x hd
-        return context
-
-class DecoderLSTM(nn.Module):
-    def __init__(self, embedding, h_dim, num_layers, dropout_p=0.0):
-        super(DecoderLSTM, self).__init__()
-        self.vocab_size, self.embedding_size = embedding.size()
-        self.num_layers, self.h_dim, self.dropout_p = num_layers, h_dim, dropout_p
+class Encoder(nn.Module):
+    """Encodes a sequence of word embeddings"""
+    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.):
+        super(Encoder, self).__init__()
+        self.num_layers = num_layers
+        self.rnn = nn.GRU(input_size, hidden_size, num_layers, 
+                          batch_first=True, bidirectional=True, dropout=dropout)
         
-        # Create embedding and LSTM
-        self.embedding = nn.Embedding(self.vocab_size, self.embedding_size)
-        self.embedding.weight.data.copy_(embedding) 
-        self.lstm = nn.LSTM(self.embedding_size, self.h_dim, self.num_layers, dropout=self.dropout_p)
-        self.dropout = nn.Dropout(self.dropout_p)
+    def forward(self, x, mask, lengths):
+        """
+        Applies a bidirectional GRU to sequence of embeddings x.
+        The input mini-batch x needs to be sorted by length.
+        x should have dimensions [batch, time, dim].
+        """
+        packed = pack_padded_sequence(x, lengths, batch_first=True)
+        output, final = self.rnn(packed)
+        output, _ = pad_packed_sequence(output, batch_first=True)
+
+        # we need to manually concatenate the final states for both directions
+        fwd_final = final[0:final.size(0):2]
+        bwd_final = final[1:final.size(0):2]
+        final = torch.cat([fwd_final, bwd_final], dim=2)  # [num_layers, batch, 2*dim]
+
+        return output, final
+
+class Decoder(nn.Module):
+    """A conditional RNN decoder with attention."""
     
-    def forward(self, x, h0):
-        '''Embed text and pass through LSTM'''
-        x = self.embedding(x)
-        x = self.dropout(x)
-        out, h = self.lstm(x, h0)
-        return out, h
-
-class Seq2seq(nn.Module):
-    def __init__(self, embedding_src, embedding_tgt, h_dim, num_layers, dropout_p, bi, tokens_bos_eos_pad_unk=[0,1,2,3]):
-        super(Seq2seq, self).__init__()
-        # Store hyperparameters
-        self.h_dim = h_dim
-        self.vocab_size_tgt, self.emb_dim_tgt = embedding_tgt.size()
-        self.bos_token, self.eos_token, self.pad_token, self.unk_token = tokens_bos_eos_pad_unk
-
-        # Create encoder, decoder, attention
-        self.encoder = EncoderLSTM(embedding_src, h_dim, num_layers, dropout_p=dropout_p, bidirectional=bi)
-        self.decoder = DecoderLSTM(embedding_tgt, h_dim, num_layers * 2 if bi else num_layers, dropout_p=dropout_p)
-        self.attention = Attention(pad_token=self.pad_token, bidirectional=bi, h_dim=self.h_dim)
-
-        # Create linear layers to combine context and hidden state
-        self.linear1 = nn.Linear(2 * self.h_dim, self.emb_dim_tgt)
-        self.tanh = nn.Tanh()
-        self.dropout = nn.Dropout(dropout_p)
-        self.linear2 = nn.Linear(self.emb_dim_tgt, self.vocab_size_tgt)
+    def __init__(self, emb_size, hidden_size, attention, num_layers=1, dropout=0.5,
+                 bridge=True):
+        super(Decoder, self).__init__()
         
-        # Share weights between decoder embedding and output 
-        if self.decoder.embedding.weight.size() == self.linear2.weight.size():
-            self.linear2.weight = self.decoder.embedding.weight
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.attention = attention
+        self.dropout = dropout
+                 
+        self.rnn = nn.GRU(emb_size + 2*hidden_size, hidden_size, num_layers,
+                          batch_first=True, dropout=dropout)
+                 
+        # to initialize from the final encoder state
+        self.bridge = nn.Linear(2*hidden_size, hidden_size, bias=True) if bridge else None
 
-    def forward(self, src, tgt):
-        if use_gpu: src = src.cuda()
+        self.dropout_layer = nn.Dropout(p=dropout)
+        self.pre_output_layer = nn.Linear(hidden_size + 2*hidden_size + emb_size,
+                                          hidden_size, bias=False)
         
-        # Encode
-        out_e, final_e = self.encoder(src)
-        
-        # Decode
-        out_d, final_d = self.decoder(tgt, final_e)
-        
-        # Attend
-        context = self.attention(src, out_e, out_d)
-        out_cat = torch.cat((out_d, context), dim=2) 
-        
-        # Predict (returns probabilities)
-        x = self.linear1(out_cat)
-        x = self.dropout(self.tanh(x))
-        x = self.linear2(x)
-        return x
+    def forward_step(self, prev_embed, encoder_hidden, src_mask, proj_key, hidden):
+        """Perform a single decoder step (1 word)"""
 
-    def predict(self, src, beam_size=1): 
-        '''Predict top 1 sentence using beam search. Note that beam_size=1 is greedy search.'''
-        beam_outputs = self.beam_search(src, beam_size, max_len=30) # returns top beam_size options (as list of tuples)
-        top1 = beam_outputs[0][1] # a list of word indices (as ints)
-        return top1
+        # compute context vector using attention mechanism
+        query = hidden[-1].unsqueeze(1)  # [#layers, B, D] -> [B, 1, D]
+        context, attn_probs = self.attention(
+            query=query, proj_key=proj_key,
+            value=encoder_hidden, mask=src_mask)
 
-    def beam_search(self, src, beam_size, max_len, remove_tokens=[]):
-        '''Returns top beam_size sentences using beam search. Works only when src has batch size 1.'''
-        if use_gpu: src = src.cuda()
+        # update rnn hidden state
+        rnn_input = torch.cat([prev_embed, context], dim=2)
+        output, hidden = self.rnn(rnn_input, hidden)
         
-        # Encode
-        outputs_e, states = self.encoder(src) # batch size = 1
-        
-        # Start with '<s>'
-        init_lprob = -1e10
-        init_sent = [self.bos_token]
-        best_options = [(init_lprob, init_sent, states)] # beam
-        
-        # Beam search
-        k = beam_size # store best k options
-        for length in range(max_len): # maximum target length
-            options = [] # candidates 
-            for lprob, sentence, current_state in best_options:
-                # Prepare last word
-                last_word = sentence[-1]
-                if last_word != self.eos_token:
-                    last_word_input = torch.LongTensor([last_word]).view(1,1)
-                    if use_gpu: last_word_input = last_word_input.cuda()
-                    # Decode
-                    outputs_d, new_state = self.decoder(last_word_input, current_state)
-                    # Attend
-                    context = self.attention(src, outputs_e, outputs_d)
-                    out_cat = torch.cat((outputs_d, context), dim=2)
-                    x = self.linear1(out_cat)
-                    x = self.dropout(self.tanh(x))
-                    x = self.linear2(x)
-                    x = x.squeeze().data.clone()
-                    # Block predictions of tokens in remove_tokens
-                    for t in remove_tokens: x[t] = -10e10
-                    lprobs = torch.log(x.exp() / x.exp().sum()) # log softmax
-                    # Add top k candidates to options list for next word
-                    for index in torch.topk(lprobs, k)[1]: 
-                        option = (float(lprobs[index]) + lprob, sentence + [index], new_state) 
-                        options.append(option)
-                else: # keep sentences ending in '</s>' as candidates
-                    options.append((lprob, sentence, current_state))
-            options.sort(key = lambda x: x[0], reverse=True) # sort by lprob
-            best_options = options[:k] # place top candidates in beam
-        best_options.sort(key = lambda x: x[0], reverse=True)
-        return best_options
+        pre_output = torch.cat([prev_embed, output, context], dim=2)
+        pre_output = self.dropout_layer(pre_output)
+        pre_output = self.pre_output_layer(pre_output)
 
-class AverageMeter(object):
-    def __init__(self):
-        self.reset()
-    def reset(self):
-        self.val, self.avg, self.sum, self.count = 0, 0, 0, 0
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
+        return output, hidden, pre_output
+    
+    def forward(self, trg_embed, encoder_hidden, encoder_final, 
+                src_mask, trg_mask, hidden=None, max_len=None):
+        """Unroll the decoder one step at a time."""
+                                         
+        # the maximum number of steps to unroll the RNN
+        if max_len is None:
+            max_len = trg_mask.size(-1)
 
-def train(train_iter, val_iter, model, criterion, optimizer, num_epochs):  
+        # initialize decoder hidden state
+        if hidden is None:
+            hidden = self.init_hidden(encoder_final)
+        
+        # pre-compute projected encoder hidden states
+        # (the "keys" for the attention mechanism)
+        # this is only done for efficiency
+        proj_key = self.attention.key_layer(encoder_hidden)
+        
+        # here we store all intermediate hidden states and pre-output vectors
+        decoder_states = []
+        pre_output_vectors = []
+        
+        # unroll the decoder RNN for max_len steps
+        for i in range(max_len):
+            prev_embed = trg_embed[:, i].unsqueeze(1)
+            output, hidden, pre_output = self.forward_step(
+              prev_embed, encoder_hidden, src_mask, proj_key, hidden)
+            decoder_states.append(output)
+            pre_output_vectors.append(pre_output)
+
+        decoder_states = torch.cat(decoder_states, dim=1)
+        pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
+        return decoder_states, hidden, pre_output_vectors  # [B, N, D]
+
+    def init_hidden(self, encoder_final):
+        """Returns the initial decoder state,
+        conditioned on the final encoder state."""
+
+        if encoder_final is None:
+            return None  # start with zeros
+
+        return torch.tanh(self.bridge(encoder_final))
+
+
+class BahdanauAttention(nn.Module):
+    """Implements Bahdanau (MLP) attention"""
+    
+    def __init__(self, hidden_size, key_size=None, query_size=None):
+        super(BahdanauAttention, self).__init__()
+        
+        # We assume a bi-directional encoder so key_size is 2*hidden_size
+        key_size = 2 * hidden_size if key_size is None else key_size
+        query_size = hidden_size if query_size is None else query_size
+
+        self.key_layer = nn.Linear(key_size, hidden_size, bias=False)
+        self.query_layer = nn.Linear(query_size, hidden_size, bias=False)
+        self.energy_layer = nn.Linear(hidden_size, 1, bias=False)
+        
+        # to store attention scores
+        self.alphas = None
+        
+    def forward(self, query=None, proj_key=None, value=None, mask=None):
+        assert mask is not None, "mask is required"
+
+        # We first project the query (the decoder state).
+        # The projected keys (the encoder states) were already pre-computated.
+        query = self.query_layer(query)
+        
+        # Calculate scores.
+        scores = self.energy_layer(torch.tanh(query + proj_key))
+        scores = scores.squeeze(2).unsqueeze(1)
+        
+        # Mask out invalid positions.
+        # The mask marks valid positions so we invert it using `mask & 0`.
+        scores.data.masked_fill_(mask == 0, -float('inf'))
+        
+        # Turn scores to probabilities.
+        alphas = F.softmax(scores, dim=-1)
+        self.alphas = alphas        
+        
+        # The context vector is the weighted sum of the values.
+        context = torch.bmm(alphas, value)
+        
+        # context shape: [B, 1, 2D], alphas shape: [B, 1, M]
+        return context, alphas
+
+
+def make_model(src_vocab, tgt_vocab, emb_size=256, hidden_size=512, num_layers=1, dropout=0.1):
+    "Helper: Construct a model from hyperparameters."
+
+    attention = BahdanauAttention(hidden_size)
+
+    model = EncoderDecoder(
+        Encoder(emb_size, hidden_size, num_layers=num_layers, dropout=dropout),
+        Decoder(emb_size, hidden_size, attention, num_layers=num_layers, dropout=dropout),
+        nn.Embedding(src_vocab, emb_size),
+        nn.Embedding(tgt_vocab, emb_size),
+        Generator(hidden_size, tgt_vocab))
+
+    return model.cuda() if USE_CUDA else model
+
+
+class Batch:
+    """Object for holding a batch of data with mask during training.
+    Input is a batch from a torch text iterator.
+    """
+    def __init__(self, src, trg, pad_index=0):
+        
+        src, src_lengths = src
+        
+        self.src = src
+        self.src_lengths = src_lengths
+        self.src_mask = (src != pad_index).unsqueeze(-2)
+        self.nseqs = src.size(0)
+        
+        self.trg = None
+        self.trg_y = None
+        self.trg_mask = None
+        self.trg_lengths = None
+        self.ntokens = None
+
+        if trg is not None:
+            trg, trg_lengths = trg
+            self.trg = trg[:, :-1]
+            self.trg_lengths = trg_lengths
+            self.trg_y = trg[:, 1:]
+            self.trg_mask = (self.trg_y != pad_index)
+            self.ntokens = (self.trg_y != pad_index).data.sum().item()
+        
+        if USE_CUDA:
+            self.src = self.src.cuda()
+            self.src_mask = self.src_mask.cuda()
+
+            if trg is not None:
+                self.trg = self.trg.cuda()
+                self.trg_y = self.trg_y.cuda()
+                self.trg_mask = self.trg_mask.cuda()
+
+
+def run_epoch(data_iter, model, loss_compute, print_every=50):
+    """Standard Training and Logging Function"""
+
+    start = time.time()
+    total_tokens = 0
+    total_loss = 0
+    print_tokens = 0
+
+    for i, batch in enumerate(data_iter, 1):
+        
+        out, _, pre_output = model.forward(batch.src, batch.trg,
+                                           batch.src_mask, batch.trg_mask,
+                                           batch.src_lengths, batch.trg_lengths)
+        loss = loss_compute(pre_output, batch.trg_y, batch.nseqs)
+        total_loss += loss
+        total_tokens += batch.ntokens
+        print_tokens += batch.ntokens
+        
+        if model.training and i % print_every == 0:
+            elapsed = time.time() - start
+            print("Epoch Step: %d Loss: %f Tokens per Sec: %f" %
+                    (i, loss / batch.nseqs, print_tokens / elapsed))
+            start = time.time()
+            print_tokens = 0
+
+    return math.exp(total_loss / float(total_tokens))
+
+
+def data_gen(num_words=11, batch_size=16, num_batches=100, length=10, pad_index=0, sos_index=1):
+    """Generate random data for a src-tgt copy task."""
+    for i in range(num_batches):
+        data = torch.from_numpy(
+          np.random.randint(1, num_words, size=(batch_size, length)))
+        data[:, 0] = sos_index
+        data = data.cuda() if USE_CUDA else data
+        src = data[:, 1:]
+        trg = data
+        src_lengths = [length-1] * batch_size
+        trg_lengths = [length] * batch_size
+        yield Batch((src, src_lengths), (trg, trg_lengths), pad_index=pad_index)
+
+
+class SimpleLossCompute:
+    """A simple loss compute and train function."""
+
+    def __init__(self, generator, criterion, opt=None):
+        self.generator = generator
+        self.criterion = criterion
+        self.opt = opt
+
+    def __call__(self, x, y, norm):
+        x = self.generator(x)
+        loss = self.criterion(x.contiguous().view(-1, x.size(-1)),
+                              y.contiguous().view(-1))
+        loss = loss / norm
+
+        if self.opt is not None:
+            loss.backward()          
+            self.opt.step()
+            self.opt.zero_grad()
+
+        return loss.data.item() * norm
+
+
+def greedy_decode(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos_index=None):
+    """Greedily decode a sentence."""
+
+    with torch.no_grad():
+        encoder_hidden, encoder_final = model.encode(src, src_mask, src_lengths)
+        prev_y = torch.ones(1, 1).fill_(sos_index).type_as(src)
+        trg_mask = torch.ones_like(prev_y)
+
+    output = []
+    attention_scores = []
+    hidden = None
+
+    for i in range(max_len):
+        with torch.no_grad():
+            out, hidden, pre_output = model.decode(
+              encoder_hidden, encoder_final, src_mask,
+              prev_y, trg_mask, hidden)
+
+            # we predict from the pre-output layer, which is
+            # a combination of Decoder state, prev emb, and context
+            prob = model.generator(pre_output[:, -1])
+
+        _, next_word = torch.max(prob, dim=1)
+        next_word = next_word.data.item()
+        output.append(next_word)
+        prev_y = torch.ones(1, 1).type_as(src).fill_(next_word)
+        attention_scores.append(model.decoder.attention.alphas.cpu().numpy())
+    
+    output = np.array(output)
+        
+    # cut off everything starting from </s> 
+    # (only when eos_index provided)
+    if eos_index is not None:
+        first_eos = np.where(output==eos_index)[0]
+        if len(first_eos) > 0:
+            output = output[:first_eos[0]]      
+    
+    return output, np.concatenate(attention_scores, axis=1)
+  
+
+def lookup_words(x, vocab=None):
+    if vocab is not None:
+        x = [vocab.itos[i] for i in x]
+
+    return [str(t) for t in x]
+
+
+def print_examples(example_iter, model, n=2, max_len=100, 
+                   sos_index=1, 
+                   src_eos_index=None, 
+                   trg_eos_index=None, 
+                   src_vocab=None, trg_vocab=None):
+    """Prints N examples. Assumes batch size of 1."""
+
+    model.eval()
+    count = 0
+    print()
+    
+    if src_vocab is not None and trg_vocab is not None:
+        src_eos_index = src_vocab.stoi[EOS_TOKEN]
+        trg_sos_index = trg_vocab.stoi[SOS_TOKEN]
+        trg_eos_index = trg_vocab.stoi[EOS_TOKEN]
+    else:
+        src_eos_index = None
+        trg_sos_index = 1
+        trg_eos_index = None
+        
+    for i, batch in enumerate(example_iter):
+      
+        src = batch.src.cpu().numpy()[0, :]
+        trg = batch.trg_y.cpu().numpy()[0, :]
+
+        # remove </s> (if it is there)
+        src = src[:-1] if src[-1] == src_eos_index else src
+        trg = trg[:-1] if trg[-1] == trg_eos_index else trg      
+      
+        result, _ = greedy_decode(
+          model, batch.src, batch.src_mask, batch.src_lengths,
+          max_len=max_len, sos_index=trg_sos_index, eos_index=trg_eos_index)
+        print("Example #%d" % (i+1))
+        print("Src : ", " ".join(lookup_words(src, vocab=src_vocab)))
+        print("Trg : ", " ".join(lookup_words(trg, vocab=trg_vocab)))
+        print("Pred: ", " ".join(lookup_words(result, vocab=trg_vocab)))
+        print()
+        
+        count += 1
+        if count == n:
+            break
+
+
+def train_copy_task():
+    """Train the simple copy task."""
+    num_words = 11
+    criterion = nn.NLLLoss(reduction="sum", ignore_index=0)
+    model = make_model(num_words, num_words, emb_size=32, hidden_size=64)
+    optim = torch.optim.Adam(model.parameters(), lr=0.0003)
+    eval_data = list(data_gen(num_words=num_words, batch_size=1, num_batches=100))
+ 
+    dev_perplexities = []
+    
+    if USE_CUDA:
+        model.cuda()
+
+    for epoch in range(100):
+        
+        print("Epoch %d" % epoch)
+
+        # train
+        model.train()
+        data = data_gen(num_words=num_words, batch_size=32, num_batches=100)
+        run_epoch(data, model,
+                  SimpleLossCompute(model.generator, criterion, optim))
+
+        # evaluate
+        model.eval()
+        with torch.no_grad(): 
+            perplexity = run_epoch(eval_data, model,
+                                   SimpleLossCompute(model.generator, criterion, None))
+            print("Evaluation perplexity: %f" % perplexity)
+            dev_perplexities.append(perplexity)
+            print_examples(eval_data, model, n=2, max_len=9)
+        
+    return dev_perplexities
+
+def plot_perplexity(perplexities):
+    """plot perplexities"""
+    plt.title("Perplexity per Epoch")
+    plt.xlabel("Epoch")
+    plt.ylabel("Perplexity")
+    plt.plot(perplexities)
+
+from torchtext import data, datasets
+import spacy
+
+spacy_de = spacy.load('de')
+spacy_en = spacy.load('en')
+
+def tokenize_de(text):
+    return [tok.text for tok in spacy_de.tokenizer(text)]
+
+def tokenize_en(text):
+    return [tok.text for tok in spacy_en.tokenizer(text)]
+
+UNK_TOKEN = "<unk>"
+PAD_TOKEN = "<pad>"    
+SOS_TOKEN = "<s>"
+EOS_TOKEN = "</s>"
+LOWER = True
+
+# we include lengths to provide to the RNNs
+SRC = data.Field(tokenize=tokenize_de, 
+                    batch_first=True, lower=LOWER, include_lengths=True,
+                    unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=None, eos_token=EOS_TOKEN)
+TRG = data.Field(tokenize=tokenize_en, 
+                    batch_first=True, lower=LOWER, include_lengths=True,
+                    unk_token=UNK_TOKEN, pad_token=PAD_TOKEN, init_token=SOS_TOKEN, eos_token=EOS_TOKEN)
+
+MAX_LEN = 25  # NOTE: we filter out a lot of sentences for speed
+train_data, valid_data, test_data = datasets.IWSLT.splits(
+    exts=('.de', '.en'), fields=(SRC, TRG), 
+    filter_pred=lambda x: len(vars(x)['src']) <= MAX_LEN and 
+        len(vars(x)['trg']) <= MAX_LEN)
+MIN_FREQ = 5  # NOTE: we limit the vocabulary to frequent words for speed
+SRC.build_vocab(train_data.src, min_freq=MIN_FREQ)
+TRG.build_vocab(train_data.trg, min_freq=MIN_FREQ)
+
+PAD_INDEX = TRG.vocab.stoi[PAD_TOKEN]
+
+def print_data_info(train_data, valid_data, test_data, src_field, trg_field):
+    """ This prints some useful stuff about our data sets. """
+
+    print("Data set sizes (number of sentence pairs):")
+    print('train', len(train_data))
+    print('valid', len(valid_data))
+    print('test', len(test_data), "\n")
+
+    print("First training example:")
+    print("src:", " ".join(vars(train_data[0])['src']))
+    print("trg:", " ".join(vars(train_data[0])['trg']), "\n")
+
+    print("Most common words (src):")
+    print("\n".join(["%10s %10d" % x for x in src_field.vocab.freqs.most_common(10)]), "\n")
+    print("Most common words (trg):")
+    print("\n".join(["%10s %10d" % x for x in trg_field.vocab.freqs.most_common(10)]), "\n")
+
+    print("First 10 words (src):")
+    print("\n".join(
+        '%02d %s' % (i, t) for i, t in enumerate(src_field.vocab.itos[:10])), "\n")
+    print("First 10 words (trg):")
+    print("\n".join(
+        '%02d %s' % (i, t) for i, t in enumerate(trg_field.vocab.itos[:10])), "\n")
+
+    print("Number of German words (types):", len(src_field.vocab))
+    print("Number of English words (types):", len(trg_field.vocab), "\n")
+
+print_data_info(train_data, valid_data, test_data, SRC, TRG)
+
+
+train_iter = data.BucketIterator(train_data, batch_size=64, train=True, 
+                                 sort_within_batch=True, 
+                                 sort_key=lambda x: (len(x.src), len(x.trg)), repeat=False,
+                                 device=DEVICE)
+valid_iter = data.Iterator(valid_data, batch_size=1, train=False, sort=False, repeat=False, 
+                           device=DEVICE)
+
+
+def rebatch(pad_idx, batch):
+    """Wrap torchtext batch into our own Batch class for pre-processing"""
+    return Batch(batch.src, batch.trg, pad_idx)
+
+
+def train(model, num_epochs=100, lr=0.0003, print_every=100):
+    """Train a model on IWSLT"""
+    
+    if USE_CUDA:
+        model.cuda()
+
+    # optionally add label smoothing; see the Annotated Transformer
+    criterion = nn.NLLLoss(reduction="sum", ignore_index=PAD_INDEX)
+    optim = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    dev_perplexities = []
+
     for epoch in range(num_epochs):
       
-        # Validate model
-        with torch.no_grad():
-          val_loss = validate(val_iter, model, criterion) 
-          print('Validating Epoch [{e}/{num_e}]\t Average loss: {l:.3f}\t Perplexity: {p:.3f}'.format(
-            e=epoch, num_e=num_epochs, l=val_loss, p=torch.FloatTensor([val_loss]).exp().item()))
-
-        # Train model
+        print("Epoch", epoch)
         model.train()
-        losses = AverageMeter()
-        for i, batch in enumerate(train_iter): 
-            src = batch.src.cuda() if use_gpu else batch.src
-            tgt = batch.trg.cuda() if use_gpu else batch.trg
-            
-            # Forward, backprop, optimizer
-            model.zero_grad()
-            scores = model(src, tgt)
-
-            # Remove <s> from target and </s> from scores (output)
-            scores = scores[:-1]
-            tgt = tgt[1:]           
-
-            # Reshape for loss function
-            scores = scores.view(scores.size(0) * scores.size(1), scores.size(2))
-            tgt = tgt.view(scores.size(0))
-
-            # Pass through loss function
-            loss = criterion(scores, tgt) 
-            loss.backward()
-            losses.update(loss.item())
-
-            # Clip gradient norms and step optimizer
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-            # Log within epoch
-            if i % 1000 == 10:
-                print('''Epoch [{e}/{num_e}]\t Batch [{b}/{num_b}]\t Loss: {l:.3f}'''.format(e=epoch+1, num_e=num_epochs, b=i, num_b=len(train_iter), l=losses.avg))
-
-        # Log after each epoch
-        print('''Epoch [{e}/{num_e}] complete. Loss: {l:.3f}'''.format(e=epoch+1, num_e=num_epochs, l=losses.avg))
-
-class PositionwiseFeedforward(nn.Module):
-    def __init__(self, hid_dim, pf_dim, dropout):
-        super().__init__()
+        train_perplexity = run_epoch((rebatch(PAD_INDEX, b) for b in train_iter), 
+                                     model,
+                                     SimpleLossCompute(model.generator, criterion, optim),
+                                     print_every=print_every)
         
-        self.hid_dim = hid_dim
-        self.pf_dim = pf_dim
-        
-        self.fc_1 = nn.Linear(hid_dim, pf_dim)
-        self.fc_2 = nn.Linear(pf_dim, hid_dim)
-        
-        self.do = nn.Dropout(dropout)
-        
-    def forward(self, x):
-        
-        #x = [batch size, sent len, hid dim]
-        
-        x = self.do(torch.relu(self.fc_1(x)))
-        
-        #x = [batch size, sent len, pf dim]
-        
-        x = self.fc_2(x)
-        
-        #x = [batch size, sent len, hid dim]
-        
-        return x
+        model.eval()
+        with torch.no_grad():
+            print_examples((rebatch(PAD_INDEX, x) for x in valid_iter), 
+                           model, n=3, src_vocab=SRC.vocab, trg_vocab=TRG.vocab)        
 
-def validate(val_iter, model, criterion):
-    '''Calculate losses by teacher forcing on the validation set'''
-    model.eval()
-    losses = AverageMeter()
-    for i, batch in enumerate(val_iter):
-        src = batch.src.cuda() if use_gpu else batch.src
-        tgt = batch.trg.cuda() if use_gpu else batch.trg
+            dev_perplexity = run_epoch((rebatch(PAD_INDEX, b) for b in valid_iter), 
+                                       model, 
+                                       SimpleLossCompute(model.generator, criterion, None))
+            print("Validation perplexity: %f" % dev_perplexity)
+            dev_perplexities.append(dev_perplexity)
         
-        # Forward 
-        scores = model(src, tgt)
-        scores = scores[:-1]
-        tgt = tgt[1:]           
-        
-        # Reshape for loss function
-        scores = scores.view(scores.size(0) * scores.size(1), scores.size(2))
-        tgt = tgt.view(scores.size(0))
-        num_words = (tgt != 0).float().sum()
-        
-        # Calculate loss
-        loss = criterion(scores, tgt) 
-        losses.update(loss.item())
-    
-    return losses.avg
+    return dev_perplexities
 
-def predict_from_text(model, input_sentence, SRC, TGT):
-    sent_german = input_sentence.split(' ') # sentence --> list of words
-    sent_indices = [SRC.vocab.stoi[word] if word in SRC.vocab.stoi else SRC.vocab.stoi['<unk>'] for word in sent_german]
-    sent = torch.LongTensor([sent_indices])
-    if use_gpu: sent = sent.cuda()
-    sent = sent.view(-1,1) # reshape to sl x bs
-    print('German: ' + ' '.join([SRC.vocab.itos[index] for index in sent_indices]))
-    # Predict five sentences with beam search 
-    pred = model.predict(sent, beam_size=5) # returns list of 5 lists of word indices
-    out = ' '.join([TGT.vocab.itos[index] for index in pred[1:-1]])
-    print('English: ' + out)
+model = make_model(len(SRC.vocab), len(TRG.vocab),
+                   emb_size=256, hidden_size=256,
+                   num_layers=1, dropout=0.2)
+dev_perplexities = train(model, print_every=100)
 
-embedding_src, embedding_tgt = load_embeddings(SRC, TGT, 'emb-13353-de.npy', 'emb-11560-en.npy')
+hypotheses = ["this is a test"]
+references = ["this is a test"]
+bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
+print(bleu)
 
-tokens = [TGT.vocab.stoi[x] for x in ['<s>', '</s>', '<pad>', '<unk>']]
-model = Seq2seq(embedding_src, embedding_tgt, 300, 2, 0.3, True, tokens_bos_eos_pad_unk=tokens)
-model = model.cuda() if use_gpu else model
+hypotheses = ["this is a test"]
+references = ["this is a fest"]
+bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
+print(bleu)
 
-weight = torch.ones(len(TGT.vocab))
-weight[TGT.vocab.stoi['<pad>']] = 0
-weight = weight.cuda() if use_gpu else weight
 
-criterion = nn.CrossEntropyLoss(weight=weight)
-optimizer = torch.optim.Adam(model.parameters(), lr=2e-3)
+len(valid_data)
 
-train(train_iter, val_iter, model, criterion, optimizer, 50)
+references = [" ".join(example.trg) for example in valid_data]
+print(len(references))
+print(references[0])
 
-with torch.no_grad():
-    val_loss = validate(val_iter, model, criterion) 
-    print('Average loss: {l:.3f}\t Perplexity: {p:.3f}'.format(l=val_loss, p=torch.FloatTensor([val_loss]).exp().item()))
+references[-2]
 
-input = "Ich kenne nur Berge, ich bleibe in den Bergen und ich liebe die Berge ."
-predict_from_text(model, input, SRC, TGT)
+hypotheses = []
+alphas = []  # save the last attention scores
+for batch in valid_iter:
+  batch = rebatch(PAD_INDEX, batch)
+  pred, attention = greedy_decode(
+    model, batch.src, batch.src_mask, batch.src_lengths, max_len=25,
+    sos_index=TRG.vocab.stoi[SOS_TOKEN],
+    eos_index=TRG.vocab.stoi[EOS_TOKEN])
+  hypotheses.append(pred)
+  alphas.append(attention)
 
-input = "Ihre Bergung erwies sich als komplizierter als gedacht ." 
-predict_from_text(model, input, SRC, TGT)
+hypotheses[0]
+
+hypotheses = [lookup_words(x, TRG.vocab) for x in hypotheses]
+hypotheses[0]
+
+hypotheses = [" ".join(x) for x in hypotheses]
+print(len(hypotheses))
+print(hypotheses[0])
+
+bleu = sacrebleu.raw_corpus_bleu(hypotheses, [references], .01).score
+print(bleu)
+
+def plot_heatmap(src, trg, scores):
+
+    fig, ax = plt.subplots()
+    heatmap = ax.pcolor(scores, cmap='viridis')
+
+    ax.set_xticklabels(trg, minor=False, rotation='vertical')
+    ax.set_yticklabels(src, minor=False)
+
+    # put the major ticks at the middle of each cell
+    # and the x-ticks on top
+    ax.xaxis.tick_top()
+    ax.set_xticks(np.arange(scores.shape[1]) + 0.5, minor=False)
+    ax.set_yticks(np.arange(scores.shape[0]) + 0.5, minor=False)
+    ax.invert_yaxis()
+
+    plt.colorbar(heatmap)
+    plt.show()
+
+idx = 5
+src = valid_data[idx].src + ["</s>"]
+trg = valid_data[idx].trg + ["</s>"]
+pred = hypotheses[idx].split() + ["</s>"]
+pred_att = alphas[idx][0].T[:, :len(pred)]
+print("src", src)
+print("ref", trg)
+print("pred", pred)
+plot_heatmap(src, pred, pred_att)
